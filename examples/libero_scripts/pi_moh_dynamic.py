@@ -1,0 +1,287 @@
+import os
+import sys
+import torch
+sys.path.append("YOUR_PROJ_DIR/MixtureOfHorizons/src")  # Change to your path!
+sys.path.append("YOUR_PROJ_DIR/MixtureOfHorizons/packages/libero")
+import collections
+import dataclasses
+import logging
+import math
+import pathlib
+
+import imageio
+from libero.libero import benchmark
+from libero.libero import get_libero_path
+from libero.libero.envs import OffScreenRenderEnv
+import numpy as np
+import pickle
+from openpi_client import image_tools
+import torch.nn.functional as F
+from openpi.policies import policy_config
+from openpi.training import config as _config
+
+import tqdm
+import tyro
+
+LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
+LIBERO_ENV_RESOLUTION = 224  # resolution used to render training data
+
+
+@dataclasses.dataclass
+class Default:
+    """Use the default policy for the given environment."""
+
+
+@dataclasses.dataclass
+class Args:
+    #################################################################################################################
+    # Model server parameters
+    #################################################################################################################
+    resize_size: int = 224
+    replan_steps: int = 5
+    rank: int = 0
+
+    #################################################################################################################
+    # LIBERO environment-specific parameters
+    #################################################################################################################
+    task_suite_name: str = (
+        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+    )
+    num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
+    num_trials_per_task: int = 50  # Number of rollouts per task
+
+    #################################################################################################################
+    # Utils
+    #################################################################################################################
+    video_out_path: str = "/home/dong_jing/code/Robot/openpi_ensemble/videos/1011_pi05e_bs32_lr5e-5_horizons_10_20_30_GateHead_StepWise_Entropy_step5k/"  # Path to save videos
+
+    seed: int = 7  # Random Seed (for reproducibility)
+    default_prompt: str | None = None
+    config: str = "pi05_libero"
+    checkpoint_dir: str = "/home/dong_jing/code/Robot/openpi_ensemble/checkpoints/pi05_libero/1011_pi05e_bs32_lr5e-5_horizons_10_20_30_GateHead_StepWise_Entropy/5000"
+    use_dynamic_replanning: bool = True  # Set to True to enable the new logic
+    min_replan_steps: int = 5  # Always execute at least this many steps
+    min_active_horizons: int = 5  # Never execute more than this many steps
+    scale_ratio: float = 1
+    save_gate_weights: bool = False
+    horizons: list[int] = dataclasses.field(default_factory=lambda: [3, 6, 9, 12, 15, 18, 21, 24, 27, 30])
+
+def eval_libero(args: Args) -> None:
+    device = f"cuda:{args.rank}"
+    current_video_out_path = args.video_out_path + args.task_suite_name
+    if not os.path.exists(current_video_out_path):
+        os.makedirs(current_video_out_path, exist_ok=False)
+
+    # Set random seed
+    np.random.seed(args.seed)
+
+    # Init Policy
+    config = _config.get_config(args.config)
+    config.horizons = args.horizons
+    inference_kwargs = {
+        "ret_weights": True,
+        "use_dynamic_replanning": args.use_dynamic_replanning,
+        "scale_ratio": args.scale_ratio,
+        "min_replan_steps": args.min_replan_steps,
+        "min_active_horizons": args.min_active_horizons,
+    }
+    print(inference_kwargs)
+    policy = policy_config.create_trained_policy(config, args.checkpoint_dir, pytorch_device=device,
+                                                 sample_kwargs=inference_kwargs)
+
+    # Initialize LIBERO task suite
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[args.task_suite_name]()
+    num_tasks_in_suite = task_suite.n_tasks
+    print(f"Task suite: {args.task_suite_name}")
+    # print(f"Select top2: {args.select_top2}")
+
+    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+
+    if args.task_suite_name == "libero_spatial":
+        max_steps = 220  # longest training demo has 193 steps
+    elif args.task_suite_name == "libero_object":
+        max_steps = 280  # longest training demo has 254 steps
+    elif args.task_suite_name == "libero_goal":
+        max_steps = 300  # longest training demo has 270 steps
+    elif args.task_suite_name == "libero_10":
+        max_steps = 520  # longest training demo has 505 steps
+    elif args.task_suite_name == "libero_90":
+        max_steps = 400  # longest training demo has 373 steps
+    else:
+        raise ValueError(f"Unknown task suite: {args.task_suite_name}")
+
+    # client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+
+    # Start evaluation
+    total_episodes, total_successes = 0, 0
+    total_replan_steps = []
+    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+        num_failure_cases = 0
+        # Get task
+        task = task_suite.get_task(task_id)
+
+        # Get default LIBERO initial states
+        initial_states = task_suite.get_task_init_states(task_id)
+
+        # Initialize LIBERO environment and task description
+        env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed, args.rank)
+
+        # Start episodes
+        task_episodes, task_successes = 0, 0
+        task_gate_weights = []
+        task_replan_steps = []
+        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+            print(f"\nTask: {task_description}")
+            cur_episode_gate_weights = []
+
+            # Reset environment
+            env.reset()
+            action_plan = collections.deque()
+
+            # Set initial states
+            obs = env.set_init_state(initial_states[episode_idx])
+
+            # Setup
+            t = 0
+            replay_images = []
+
+            print(f"Starting episode {task_episodes + 1}...")
+            while t < max_steps + args.num_steps_wait:
+                # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                # and we need to wait for them to fall
+                if t < args.num_steps_wait:
+                    obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                    t += 1
+                    continue
+
+                # Get preprocessed image
+                # IMPORTANT: rotate 180 degrees to match train preprocessing
+                img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+
+                # print(f"original image shape: {img.shape, wrist_img}")
+                img = image_tools.convert_to_uint8(
+                    image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
+                )
+                wrist_img = image_tools.convert_to_uint8(
+                    image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
+                )
+
+                # Save preprocessed image for replay video
+                replay_images.append(img)
+
+                if not action_plan:
+                    # Finished executing previous action chunk -- compute new chunk
+                    # Prepare observations dict
+                    element = {
+                        "observation/image": img,
+                        "observation/wrist_image": wrist_img,
+                        "observation/state": np.concatenate(
+                            (
+                                obs["robot0_eef_pos"],
+                                _quat2axisangle(obs["robot0_eef_quat"]),
+                                obs["robot0_gripper_qpos"],
+                            )
+                        ),
+                        "prompt": str(task_description),
+                    }
+
+                    # Query model to get action
+                    with torch.inference_mode():
+                        outputs = policy.infer(element)
+                        action_chunk = outputs["actions"]
+                        gate_weights = outputs["gate_weights"]
+                        cur_episode_gate_weights.append(np.asarray(gate_weights))
+
+                    if args.use_dynamic_replanning:
+                        replan_steps = outputs.get("replan_steps", len(action_chunk))
+                        print(f"  [Dynamic Replanning]: Consensus found. Executing {replan_steps} steps.")
+                        action_plan.extend(action_chunk)
+                        task_replan_steps.append(replan_steps)
+                    else:
+                        # Original fixed replanning logic
+                        assert (
+                                len(action_chunk) >= args.replan_steps
+                        ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
+                        action_plan.extend(action_chunk[: args.replan_steps])
+
+                action = action_plan.popleft()
+
+                # Execute action in environment
+                obs, reward, done, info = env.step(action.tolist())
+                if done:
+                    task_successes += 1
+                    total_successes += 1
+                    break
+                t += 1
+
+            task_episodes += 1
+            total_episodes += 1
+            task_gate_weights.append(cur_episode_gate_weights)
+
+            # Save a replay video of the episode
+            if done:
+                suffix = "success"
+            else:
+                suffix = f"failure_{num_failure_cases}"
+                num_failure_cases += 1
+
+            task_segment = task_description.replace(" ", "_")
+            imageio.mimwrite(
+                pathlib.Path(current_video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                [np.asarray(x) for x in replay_images],
+                fps=10,
+            )
+
+            # Log current results
+            print(f"Success: {done}")
+            print(f"# episodes completed so far: {total_episodes}")
+            print(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
+
+        if args.save_gate_weights:
+            with open(pathlib.Path(current_video_out_path) / f"rollout_{task_segment}_weights.pkl", 'wb') as f:
+                pickle.dump(task_gate_weights, f)
+
+        # Log final results
+        print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        print(f"Current average selected steps per sample: {sum(task_replan_steps) / len(task_replan_steps)}")
+        total_replan_steps += task_replan_steps
+
+    print(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    print(f"Total episodes: {total_episodes}")
+    print(f"Total average selected steps per sample: {sum(total_replan_steps) / len(total_replan_steps)}")
+
+
+def _get_libero_env(task, resolution, seed, rank=0):
+    """Initializes and returns the LIBERO environment, along with the task description."""
+    task_description = task.language
+    task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
+    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution,
+                "render_gpu_device_id": rank}
+    env = OffScreenRenderEnv(**env_args)
+    env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
+    return env, task_description
+
+
+def _quat2axisangle(quat):
+    """
+    Copied from robosuite: https://github.com/ARISE-Initiative/robosuite/blob/eafb81f54ffc104f905ee48a16bb15f059176ad3/robosuite/utils/transform_utils.py#L490C1-L512C55
+    """
+    # clip quaternion
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        # This is (close to) a zero degree rotation, immediately return
+        return np.zeros(3)
+
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+if __name__ == "__main__":
+    eval_libero(tyro.cli(Args))
