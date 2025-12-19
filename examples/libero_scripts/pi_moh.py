@@ -1,6 +1,6 @@
 import sys
-sys.path.append("YOUR_PROJ_DIR/MixtureOfHorizons/src")  # Change to your path!
-sys.path.append("YOUR_PROJ_DIR/MixtureOfHorizons/packages/libero")
+sys.path.append("/home/txs/Code/Policy_Eval_Done_Right/MixtureOfHorizons/src")  # Change to your path!
+sys.path.append("/home/txs/Code/Policy_Eval_Done_Right/LIBERO")  # Use standalone LIBERO
 import os
 import torch
 import collections
@@ -10,6 +10,8 @@ import pathlib
 import imageio
 import numpy as np
 import pickle
+import json
+from datetime import datetime
 from openpi_client import image_tools
 from openpi.policies import policy_config
 from openpi.training import config as _config
@@ -51,7 +53,8 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = ""  # Path to save videos
+    results_dir: str = ""  # Path to save results (config.json and result.json)
+    video_out_path: str = ""  # Path to save videos (defaults to <results_dir>/<timestamp>/videos/ if not provided)
 
     seed: int = 7  # Random Seed (for reproducibility)
     default_prompt: str | None = None
@@ -62,9 +65,29 @@ class Args:
 
 def eval_libero(args: Args) -> None:
     device = f"cuda:{args.rank}"
-    current_video_out_path = args.video_out_path + args.task_suite_name
+    
+    # Create timestamped results directory
+    timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+    results_subdir = None
+    if args.results_dir:
+        results_subdir = pathlib.Path(args.results_dir) / f"{args.task_suite_name}_{timestamp}"
+        results_subdir.mkdir(parents=True, exist_ok=True)
+        
+        # Save config to config.json
+        config_dict = dataclasses.asdict(args)
+        with open(results_subdir / "config.json", "w") as f:
+            json.dump(config_dict, f, indent=2)
+    
+    # Set video_out_path to default if not provided
+    if args.video_out_path:
+        current_video_out_path = args.video_out_path + args.task_suite_name
+    elif results_subdir:
+        current_video_out_path = str(results_subdir / "videos")
+    else:
+        current_video_out_path = f"./videos/{args.task_suite_name}_{timestamp}"
+    
     if not os.path.exists(current_video_out_path):
-        os.makedirs(current_video_out_path, exist_ok=False)
+        os.makedirs(current_video_out_path, exist_ok=True)
 
     # Set random seed
     np.random.seed(args.seed)
@@ -100,6 +123,8 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    task_results = {}  # Store per-task results
+    
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         num_failure_cases = 0
         # Get task
@@ -107,6 +132,9 @@ def eval_libero(args: Args) -> None:
 
         # Get default LIBERO initial states
         initial_states = task_suite.get_task_init_states(task_id)
+
+        init_states_path = pathlib.Path(get_libero_path("init_states")) / task.problem_folder / task.init_states_file
+        print(f"Using init states: {init_states_path}")
 
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed, args.rank)
@@ -217,12 +245,43 @@ def eval_libero(args: Args) -> None:
             with open(pathlib.Path(current_video_out_path) / f"rollout_{task_segment}_weights.pkl", 'wb') as f:
                 pickle.dump(task_gate_weights, f)
 
+        # Store per-task results
+        task_name = task_description.replace(" ", "_")
+        task_results[task_name] = {
+            "rollouts": task_episodes,
+            "successes": task_successes,
+            "failures": task_episodes - task_successes,
+            "success_rate": float(task_successes) / float(task_episodes) if task_episodes > 0 else 0.0,
+            "checkpoint_path": args.checkpoint_dir,
+            "config_name": args.config
+        }
+
         # Log final results
         print(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         print(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
+        # Close the environment to release resources properly
+        env.close()
+
     print(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     print(f"Total episodes: {total_episodes}")
+    
+    # Save results to result.json
+    if results_subdir:
+        results = {
+            "tasks": task_results,
+            "suite": {
+                "rollouts": total_episodes,
+                "successes": total_successes,
+                "failures": total_episodes - total_successes,
+                "success_rate": float(total_successes) / float(total_episodes) if total_episodes > 0 else 0.0,
+                "task_suite_name": args.task_suite_name,
+                "checkpoint_path": args.checkpoint_dir
+            }
+        }
+        with open(results_subdir / "result.json", "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved to: {results_subdir / 'result.json'}")
 
 
 def _get_libero_env(task, resolution, seed, rank=0):
