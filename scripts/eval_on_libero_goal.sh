@@ -1,6 +1,6 @@
 EXP_NAME="pi05_moh_test"
 # SUITES=("libero_object" "libero_spatial" "libero_goal" "libero_10")
-SUITES=("libero_object")
+SUITES=("libero_goal")
 # RANKS=(0 0 0 0)
 RANKS=(0)
 VIDEO_OUT_PATH="./videos/${EXP_NAME}_"

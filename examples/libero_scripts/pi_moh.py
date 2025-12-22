@@ -1,6 +1,8 @@
 import sys
-sys.path.append("/home/txs/Code/Policy_Eval_Done_Right/MixtureOfHorizons/src")  # Change to your path!
-sys.path.append("/home/txs/Code/Policy_Eval_Done_Right/LIBERO")  # Use standalone LIBERO
+# sys.path.append("/home/txs/Code/Policy_Eval_Done_Right/MixtureOfHorizons/src")  # Change to your path!
+# sys.path.append("/home/txs/Code/Policy_Eval_Done_Right/LIBERO")  # Use standalone LIBERO
+sys.path.append("/share/data/ripl/vincenttann/Code/MixtureOfHorizons/src")
+sys.path.append("/share/data/ripl/vincenttann/Code/Policy_Eval_Done_Right/LIBERO")
 import os
 import torch
 import collections
@@ -75,6 +77,7 @@ def eval_libero(args: Args) -> None:
         
         # Save config to config.json
         config_dict = dataclasses.asdict(args)
+        config_dict["init_states_path"] = str(pathlib.Path(get_libero_path("init_states")))
         with open(results_subdir / "config.json", "w") as f:
             json.dump(config_dict, f, indent=2)
     
